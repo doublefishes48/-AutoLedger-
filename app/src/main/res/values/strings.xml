@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">自动记账</string>
+    <string name="notification_service_label">自动记账通知识别</string>
+    <string name="accessibility_service_label">自动记账页面识别</string>
+    <string name="accessibility_service_description">仅用于识别微信、支付宝、云闪付支付成功页面中的商户和金额，不会点击按钮、付款或读取密码。</string>
+</resources>
+
