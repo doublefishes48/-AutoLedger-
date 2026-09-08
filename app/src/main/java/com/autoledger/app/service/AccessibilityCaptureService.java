@@ -1,7 +1,13 @@
 package com.autoledger.app.service;
 
+import android.annotation.SuppressLint;
 import android.accessibilityservice.AccessibilityService;
+import android.content.Context;
+import android.graphics.PixelFormat;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.View;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
@@ -10,6 +16,7 @@ import com.autoledger.app.capture.CaptureChannel;
 import com.autoledger.app.capture.CapturePackages;
 import com.autoledger.app.capture.CaptureRouter;
 import com.autoledger.app.data.DebugLog;
+import com.autoledger.app.data.LedgerRepository;
 
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -21,12 +28,24 @@ import java.util.concurrent.Executors;
 public class AccessibilityCaptureService extends AccessibilityService {
     private static final String TAG = "AutoLedger";
 
+    private static AccessibilityCaptureService runningInstance;
+
     private static final String[] COMPLETION_MARKERS = {
             "付款成功", "支付成功", "交易成功", "收款成功", "已付款", "支付完成",
             "到账成功", "退款成功", "支付凭证", "扣款成功"
     };
 
     private ExecutorService executor;
+    private WindowManager windowManager;
+    private View keepAliveOverlay;
+    private boolean overlayAttached;
+
+    public static void refreshKeepAliveOverlay(Context context) {
+        AccessibilityCaptureService service = runningInstance;
+        if (service != null) {
+            service.syncKeepAliveOverlay(context);
+        }
+    }
 
     @Override
     public void onCreate() {
@@ -36,6 +55,18 @@ public class AccessibilityCaptureService extends AccessibilityService {
             thread.setDaemon(true);
             return thread;
         });
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+    }
+
+    @Override
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+        runningInstance = this;
+        if (LedgerRepository.get(this).isKeepAliveEnabled()) {
+            KeepAliveService.start(this);
+            attachKeepAliveOverlay();
+        }
+        DebugLog.append(this, "accessibility service connected overlay=" + overlayAttached);
     }
 
     @Override
@@ -88,10 +119,65 @@ public class AccessibilityCaptureService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        if (runningInstance == this) {
+            runningInstance = null;
+        }
+        detachKeepAliveOverlay();
         if (executor != null) {
             executor.shutdown();
         }
         super.onDestroy();
+    }
+
+    private void syncKeepAliveOverlay(Context context) {
+        if (LedgerRepository.get(context).isKeepAliveEnabled()) {
+            attachKeepAliveOverlay();
+        } else {
+            detachKeepAliveOverlay();
+        }
+    }
+
+    @SuppressLint("WrongConstant")
+    private synchronized void attachKeepAliveOverlay() {
+        if (overlayAttached || windowManager == null) {
+            return;
+        }
+        try {
+            View overlay = new View(this);
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams();
+            params.type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY;
+            params.format = PixelFormat.TRANSLUCENT;
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+            params.gravity = Gravity.START | Gravity.TOP;
+            params.width = 1;
+            params.height = 1;
+            params.packageName = getPackageName();
+            windowManager.addView(overlay, params);
+            keepAliveOverlay = overlay;
+            overlayAttached = true;
+            DebugLog.append(this, "accessibility keepalive overlay attached");
+        } catch (Throwable error) {
+            overlayAttached = false;
+            keepAliveOverlay = null;
+            DebugLog.append(this, "accessibility keepalive overlay failed " + error);
+        }
+    }
+
+    private synchronized void detachKeepAliveOverlay() {
+        if (!overlayAttached || windowManager == null || keepAliveOverlay == null) {
+            overlayAttached = false;
+            keepAliveOverlay = null;
+            return;
+        }
+        try {
+            windowManager.removeView(keepAliveOverlay);
+        } catch (Throwable ignored) {
+        }
+        keepAliveOverlay = null;
+        overlayAttached = false;
+        DebugLog.append(this, "accessibility keepalive overlay removed");
     }
 
     private static String truncate(String value, int max) {

@@ -45,6 +45,20 @@ public final class ServiceGuard {
                     SETTING_ENABLED_NOTIFICATION_LISTENERS,
                     NotificationCaptureService.class
             );
+            if (fixedNotification && ShizukuSupport.isPermissionGranted()) {
+                ComponentName component = new ComponentName(
+                        context,
+                        NotificationCaptureService.class
+                );
+                boolean shellBound = ShizukuSupport.runShell(
+                        "cmd notification allow_listener "
+                                + component.flattenToString()
+                );
+                DebugLog.append(
+                        context,
+                        "service guard listener shell bound=" + shellBound
+                );
+            }
         }
 
         boolean fixedAccessibility = true;

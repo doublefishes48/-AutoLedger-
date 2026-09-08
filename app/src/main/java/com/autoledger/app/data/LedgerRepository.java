@@ -377,6 +377,14 @@ public final class LedgerRepository {
         setSetting("keep_alive_enabled", enabled ? "1" : "0");
     }
 
+    public boolean isHideFromRecentsEnabled() {
+        return "1".equals(getSetting("hide_from_recents"));
+    }
+
+    public void setHideFromRecentsEnabled(boolean enabled) {
+        setSetting("hide_from_recents", enabled ? "1" : "0");
+    }
+
     private String getSetting(String key) {
         synchronized (database) {
             Cursor cursor = database.getReadableDatabase().query(

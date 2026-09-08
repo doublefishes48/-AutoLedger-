@@ -11,26 +11,36 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
 
-import java.util.concurrent.ExecutorService;
+import com.autoledger.app.data.DebugLog;
+import com.autoledger.app.data.LedgerRepository;
+
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class KeepAliveService extends Service {
     private static final String CHANNEL_ID = "autoledger_keepalive";
     private static final int NOTIFICATION_ID = 1;
     private static final int GUARD_REQUEST_CODE = 2401;
     private static final long GUARD_DELAY_MS = 60_000L;
-    private static final long GUARD_INTERVAL_MS = 30L * 60L * 1000L;
+    private static final long GUARD_INTERVAL_MS = 5L * 60L * 1000L;
+    private static final long WATCHDOG_DELAY_MS = 45L * 1000L;
+    private static final long WATCHDOG_INTERVAL_MS = 60L * 1000L;
     public static final String ACTION_GUARD = "com.autoledger.app.action.SERVICE_GUARD";
 
-    private ExecutorService worker;
+    private ScheduledExecutorService worker;
 
     public static void start(Context context) {
-        Intent intent = new Intent(context, KeepAliveService.class);
-        intent.setAction("start");
-        if (Build.VERSION.SDK_INT >= 26) {
-            context.startForegroundService(intent);
-        } else {
-            context.startService(intent);
+        try {
+            Intent intent = new Intent(context, KeepAliveService.class);
+            intent.setAction("start");
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } catch (Throwable error) {
+            DebugLog.append(context, "keepalive start blocked " + error);
         }
     }
 
@@ -41,7 +51,7 @@ public class KeepAliveService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        worker = Executors.newSingleThreadExecutor(runnable -> {
+        worker = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "autoledger-guard");
             thread.setDaemon(true);
             return thread;
@@ -58,6 +68,18 @@ public class KeepAliveService extends Service {
         startForeground(NOTIFICATION_ID, notification);
         scheduleGuard();
         worker.execute(() -> ServiceGuard.run(this));
+        worker.scheduleWithFixedDelay(
+                () -> {
+                    if (LedgerRepository.get(this).isKeepAliveEnabled()) {
+                        ServiceGuard.run(this);
+                        AccessibilityCaptureService.refreshKeepAliveOverlay(this);
+                    }
+                },
+                WATCHDOG_DELAY_MS,
+                WATCHDOG_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+        );
+        DebugLog.append(this, "keepalive service started");
     }
 
     @Override

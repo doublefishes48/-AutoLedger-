@@ -31,10 +31,12 @@ import android.widget.Toast;
 import com.autoledger.app.capture.CategoryCatalog;
 import com.autoledger.app.capture.CsvBillImporter;
 import com.autoledger.app.capture.SourceKey;
+import com.autoledger.app.data.DebugLog;
 import com.autoledger.app.data.LedgerEntry;
 import com.autoledger.app.data.LedgerRepository;
 import com.autoledger.app.data.RawCaptureRecord;
 import com.autoledger.app.service.AccessibilityCaptureService;
+import com.autoledger.app.service.BackgroundTaskHider;
 import com.autoledger.app.service.KeepAliveService;
 import com.autoledger.app.service.NotificationCaptureService;
 import com.autoledger.app.service.ServiceGuard;
@@ -81,11 +83,13 @@ public class MainActivity extends Activity {
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("M月d日 HH:mm", Locale.CHINA);
     private LedgerRepository repository;
     private LinearLayout content;
+    private int externalLaunches;
     private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener =
             (requestCode, result) -> {
                 if (requestCode != SHIZUKU_PERMISSION_REQUEST) {
                     return;
                 }
+                externalLaunches = 0;
                 boolean granted = result == android.content.pm.PackageManager.PERMISSION_GRANTED;
                 if (granted) {
                     boolean writeGranted = ShizukuSupport.grantWriteSecureSettings(this);
@@ -129,15 +133,33 @@ public class MainActivity extends Activity {
         render();
         if (repository.isKeepAliveEnabled()) {
             KeepAliveService.start(this);
+            AccessibilityCaptureService.refreshKeepAliveOverlay(this);
         }
+        BackgroundTaskHider.apply(this);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        externalLaunches = 0;
         render();
         if (repository.isKeepAliveEnabled()) {
             KeepAliveService.start(this);
+            AccessibilityCaptureService.refreshKeepAliveOverlay(this);
+        }
+        BackgroundTaskHider.apply(this);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        boolean shouldHide = repository.isHideFromRecentsEnabled()
+                && externalLaunches == 0
+                && !isChangingConfigurations()
+                && !isFinishing();
+        if (shouldHide) {
+            DebugLog.append(this, "background task removed by finish");
+            finishAndRemoveTask();
         }
     }
 
@@ -527,8 +549,12 @@ public class MainActivity extends Activity {
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         try {
+            externalLaunches++;
             startActivityForResult(intent, BILL_IMPORT_REQUEST);
         } catch (Exception ignored) {
+            if (externalLaunches > 0) {
+                externalLaunches--;
+            }
             Toast.makeText(this, "无法打开文件选择器", Toast.LENGTH_SHORT).show();
         }
     }
@@ -632,10 +658,22 @@ public class MainActivity extends Activity {
         CheckBox keepAlive = new CheckBox(this);
         keepAlive.setText("后台保活通知（澎湃/MIUI建议开启）");
         keepAlive.setChecked(repository.isKeepAliveEnabled());
+        CheckBox hideRecents = new CheckBox(this);
+        hideRecents.setText("后台隐藏：从最近任务里隐藏这张卡片");
+        hideRecents.setChecked(repository.isHideFromRecentsEnabled());
         boolean shizukuReady = ShizukuSupport.isPermissionGranted()
                 || ShizukuSupport.canWriteSecureSettings(this);
         Button shizuku = button("授权 Shizuku 自愈", COLOR_PRIMARY);
         shizuku.setOnClickListener(v -> showShizukuSetup());
+        Button quickRestart = button("无感保活：添加快捷开关", COLOR_ACTION_SETTINGS);
+        quickRestart.setOnClickListener(v -> {
+            if (!ShizukuSupport.isPermissionGranted()
+                    && !ShizukuSupport.canWriteSecureSettings(this)) {
+                showShizukuSetup();
+            } else {
+                showQuickRestartGuide();
+            }
+        });
         CheckBox rootHook = new CheckBox(this);
         rootHook.setText("允许未来 Root Hook 广播（默认关）");
         rootHook.setChecked(repository.isSourceEnabled(SourceKey.ROOT_HOOK));
@@ -645,7 +683,9 @@ public class MainActivity extends Activity {
         form.addView(unionpay);
         form.addView(autoConfirm);
         form.addView(keepAlive);
+        form.addView(hideRecents);
         form.addView(shizuku);
+        form.addView(quickRestart);
         form.addView(bodyText(
                 "Shizuku 状态：" + (shizukuReady ? "已授权" : "未授权")
                         + "。可自动补回被澎湃系统移除的监听权限。",
@@ -674,6 +714,8 @@ public class MainActivity extends Activity {
             repository.setSourceEnabled(SourceKey.ALIPAY, alipay.isChecked());
             repository.setSourceEnabled(SourceKey.UNIONPAY, unionpay.isChecked());
             repository.setAutoConfirmEnabled(autoConfirm.isChecked());
+            boolean hideRecentsEnabled = hideRecents.isChecked();
+            repository.setHideFromRecentsEnabled(hideRecentsEnabled);
             boolean keepAliveEnabled = keepAlive.isChecked();
             repository.setKeepAliveEnabled(keepAliveEnabled);
             if (keepAliveEnabled) {
@@ -681,10 +723,24 @@ public class MainActivity extends Activity {
             } else {
                 KeepAliveService.stop(this);
             }
+            AccessibilityCaptureService.refreshKeepAliveOverlay(this);
+            BackgroundTaskHider.apply(this);
             repository.setSourceEnabled(SourceKey.ROOT_HOOK, rootHook.isChecked());
             dialog.dismiss();
             render();
         });
+    }
+
+    private void showQuickRestartGuide() {
+        new AlertDialog.Builder(this)
+                .setTitle("无感保活：快捷开关")
+                .setMessage(
+                        "1. 下拉通知栏，点右上角编辑/更多，进入快捷开关面板\n\n"
+                                + "2. 找到“自动记账”，点 + 号或拖到上方\n\n"
+                                + "3. 以后后台服务被系统杀掉，下拉通知栏点这个开关即可自动拉起并修复监听。"
+                )
+                .setPositiveButton("完成", null)
+                .show();
     }
 
     private void showShizukuSetup() {
@@ -721,6 +777,7 @@ public class MainActivity extends Activity {
             render();
             return;
         }
+        externalLaunches++;
         ShizukuSupport.requestPermission(SHIZUKU_PERMISSION_REQUEST);
     }
 
@@ -773,12 +830,18 @@ public class MainActivity extends Activity {
 
     private void openSettings(Class<?> service, boolean notificationListener) {
         try {
+            Intent intent;
             if (notificationListener) {
-                startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                intent = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
             } else {
-                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
             }
+            externalLaunches++;
+            startActivity(intent);
         } catch (Exception ignored) {
+            if (externalLaunches > 0) {
+                externalLaunches--;
+            }
             Toast.makeText(this, "无法打开系统设置", Toast.LENGTH_SHORT).show();
         }
     }

@@ -75,10 +75,20 @@ public final class ShizukuSupport {
                     == PackageManager.PERMISSION_GRANTED) {
                 return true;
             }
+            return runShell("pm grant "
+                    + context.getPackageName()
+                    + " "
+                    + Manifest.permission.WRITE_SECURE_SETTINGS);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static boolean runShell(String command) {
+        try {
             if (!isPermissionGranted()) {
                 return false;
             }
-
             Class<?> shizuku = Class.forName("rikka.shizuku.Shizuku");
             Method newProcess = shizuku.getDeclaredMethod(
                     "newProcess",
@@ -87,10 +97,6 @@ public final class ShizukuSupport {
                     String.class
             );
             newProcess.setAccessible(true);
-            String command = "pm grant "
-                    + context.getPackageName()
-                    + " "
-                    + Manifest.permission.WRITE_SECURE_SETTINGS;
             Object process = newProcess.invoke(
                     null,
                     new String[]{"sh", "-c", command},
