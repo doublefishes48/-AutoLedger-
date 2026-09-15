@@ -6,6 +6,7 @@ import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 
 import com.autoledger.app.capture.CategoryCatalog;
+import com.autoledger.app.capture.CaptureChannel;
 import com.autoledger.app.capture.CapturePackages;
 import com.autoledger.app.capture.CsvBillImporter;
 import com.autoledger.app.capture.RecognitionResult;
@@ -20,8 +21,18 @@ public final class LedgerRepository {
     private static final String TABLE_RAW_CAPTURES = LedgerDatabase.TABLE_RAW_CAPTURES;
     private static final String TABLE_SETTINGS = LedgerDatabase.TABLE_SETTINGS;
     private static final double AUTO_CONFIRM_THRESHOLD = 0.82;
+    private static final long LARGE_EXPENSE_MULTIPLIER = 2L;
+    private static final long RECENT_DUPLICATE_WINDOW_MS = 12L * 60L * 60L * 1000L;
+    private static final long RECENT_AMOUNT_WINDOW_MS = 30L * 60L * 1000L;
+    private static final long EVIDENCE_MERGE_WINDOW_MS = 5L * 60L * 1000L;
+    private static final int AMOUNT_CONFLICT_THRESHOLD = 3;
+    private static final java.util.regex.Pattern CURRENCY_AMOUNT = java.util.regex.Pattern.compile(
+            "[¥￥]\\s*([0-9]{1,9}(?:\\.[0-9]{1,2})?)"
+                    + "|([0-9]{1,9}(?:\\.[0-9]{1,2})?)\\s*元"
+    );
 
     private static volatile LedgerRepository instance;
+    private final Context context;
     private final LedgerDatabase database;
 
     public static LedgerRepository get(Context context) {
@@ -36,6 +47,7 @@ public final class LedgerRepository {
     }
 
     private LedgerRepository(Context context) {
+        this.context = context.getApplicationContext();
         this.database = LedgerDatabase.get(context);
     }
 
@@ -283,7 +295,10 @@ public final class LedgerRepository {
                 if (rawId == -1) {
                     writeResult = 2;
                 } else {
-                    if (isAutoConfirmEnabled() && result.confidence >= AUTO_CONFIRM_THRESHOLD) {
+                    String reviewReason = reviewReason(db, result);
+                    if (isAutoConfirmEnabled()
+                            && result.confidence >= AUTO_CONFIRM_THRESHOLD
+                            && reviewReason == null) {
                         ContentValues transaction = transactionValues(
                                 result.amountCents,
                                 result.direction,
@@ -296,6 +311,12 @@ public final class LedgerRepository {
                         );
                         db.insert(TABLE_TRANSACTIONS, null, transaction);
                         markCaptureStatus(db, rawId, RawCaptureRecord.STATUS_CONFIRMED);
+                    } else if (reviewReason != null) {
+                        DebugLog.append(
+                                context,
+                                "capture held for confirmation reason=" + reviewReason
+                                        + " amount=" + result.amountCents
+                        );
                     }
                     writeResult = 1;
                 }
@@ -305,6 +326,156 @@ public final class LedgerRepository {
             }
         }
         return writeResult;
+    }
+
+    private static String reviewReason(
+            SQLiteDatabase db,
+            RecognitionResult result
+    ) {
+        if (LedgerEntry.DIRECTION_EXPENSE.equals(result.direction)
+                && exceedsHistoricalExpenseMaximum(
+                result.amountCents,
+                historicalMaxExpense(db)
+        )) {
+            return "large_expense";
+        }
+        if (isSuspiciousMerchant(result.merchant)) {
+            return "suspicious_merchant";
+        }
+        if (CaptureChannel.ACCESSIBILITY.equals(result.channel)
+                && countCurrencyAmounts(result.rawText) >= AMOUNT_CONFLICT_THRESHOLD) {
+            return "amount_conflict";
+        }
+        if (hasRecentAmountDuplicate(db, result)) {
+            return "amount_duplicate";
+        }
+        if (hasRecentDuplicate(db, result)) {
+            return "recent_duplicate";
+        }
+        return null;
+    }
+
+    static boolean exceedsHistoricalExpenseMaximum(
+            long amountCents,
+            long historicalMaximumCents
+    ) {
+        return historicalMaximumCents > 0
+                && amountCents > historicalMaximumCents * LARGE_EXPENSE_MULTIPLIER;
+    }
+
+    private static long historicalMaxExpense(SQLiteDatabase db) {
+        Cursor cursor = db.rawQuery(
+                "SELECT COALESCE(MAX(amount_cents),0) FROM " + TABLE_TRANSACTIONS
+                        + " WHERE direction='EXPENSE'",
+                null
+        );
+        try {
+            return cursor.moveToFirst() ? cursor.getLong(0) : 0L;
+        } finally {
+            cursor.close();
+        }
+    }
+
+    static int countCurrencyAmounts(String text) {
+        if (text == null || text.isEmpty()) {
+            return 0;
+        }
+        java.util.Set<String> amounts = new java.util.HashSet<>();
+        java.util.regex.Matcher matcher = CURRENCY_AMOUNT.matcher(text);
+        while (matcher.find()) {
+            String value = matcher.group(1);
+            if (value == null) {
+                value = matcher.group(2);
+            }
+            if (value != null) {
+                amounts.add(value);
+            }
+        }
+        return amounts.size();
+    }
+
+    static boolean isSuspiciousMerchant(String merchant) {
+        if (merchant == null || merchant.isEmpty()) {
+            return false;
+        }
+        String value = merchant.trim();
+        return value.matches("\\d{1,2}:\\d{2}")
+                || value.matches("\\d{1,2}月\\d{1,2}日")
+                || value.startsWith("¥")
+                || value.startsWith("￥")
+                || (value.contains("尾号") && value.contains("银行卡"))
+                || value.contains("点击")
+                || value.contains("领取")
+                || value.equals("全部会话")
+                || value.equals("消息盒子")
+                || value.equals("消息")
+                || value.equals("首页")
+                || value.equals("我的")
+                || value.equals("更多")
+                || value.equals("全部")
+                || value.equals("收付款")
+                || value.equals("扫一扫")
+                || value.equals("卡包")
+                || value.equals("出行")
+                || value.equals("通讯录")
+                || value.matches("消息\\(\\d+.*");
+    }
+
+    private static boolean hasRecentAmountDuplicate(
+            SQLiteDatabase db,
+            RecognitionResult result
+    ) {
+        Cursor cursor = db.query(
+                TABLE_TRANSACTIONS,
+                new String[]{"id"},
+                "source_key=? AND direction=? AND amount_cents=?"
+                        + " AND occurred_at>=? AND occurred_at<=?",
+                new String[]{
+                        result.sourceKey,
+                        result.direction,
+                        String.valueOf(result.amountCents),
+                        String.valueOf(result.occurredAt - RECENT_AMOUNT_WINDOW_MS),
+                        String.valueOf(result.occurredAt)
+                },
+                null,
+                null,
+                null,
+                "1"
+        );
+        try {
+            return cursor.moveToFirst();
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static boolean hasRecentDuplicate(
+            SQLiteDatabase db,
+            RecognitionResult result
+    ) {
+        Cursor cursor = db.query(
+                TABLE_TRANSACTIONS,
+                new String[]{"id"},
+                "source_key=? AND direction=? AND amount_cents=? AND merchant=?"
+                        + " AND occurred_at>=? AND occurred_at<=?",
+                new String[]{
+                        result.sourceKey,
+                        result.direction,
+                        String.valueOf(result.amountCents),
+                        result.merchant == null ? "" : result.merchant,
+                        String.valueOf(result.occurredAt - RECENT_DUPLICATE_WINDOW_MS),
+                        String.valueOf(result.occurredAt)
+                },
+                null,
+                null,
+                null,
+                "1"
+        );
+        try {
+            return cursor.moveToFirst();
+        } finally {
+            cursor.close();
+        }
     }
 
     public void confirmRawCapture(long rawCaptureId) {
@@ -333,6 +504,105 @@ public final class LedgerRepository {
             } finally {
                 db.endTransaction();
             }
+        }
+    }
+
+    public boolean canOverwriteRecentTransaction(RawCaptureRecord raw) {
+        if (raw == null || raw.merchant == null || raw.merchant.isEmpty()) {
+            return false;
+        }
+        synchronized (database) {
+            SQLiteDatabase db = database.getReadableDatabase();
+            long transactionId = findRecentTransactionId(db, raw);
+            if (transactionId < 0) {
+                return false;
+            }
+            Cursor cursor = db.query(
+                    TABLE_TRANSACTIONS,
+                    new String[]{"merchant"},
+                    "id=?",
+                    new String[]{String.valueOf(transactionId)},
+                    null,
+                    null,
+                    null
+            );
+            try {
+                if (!cursor.moveToFirst()) {
+                    return false;
+                }
+                String existingMerchant = cursor.getString(0);
+                return existingMerchant == null
+                        || existingMerchant.isEmpty()
+                        || !existingMerchant.equals(raw.merchant);
+            } finally {
+                cursor.close();
+            }
+        }
+    }
+
+    public boolean overwriteRecentTransaction(long rawCaptureId) {
+        synchronized (database) {
+            SQLiteDatabase db = database.getWritableDatabase();
+            db.beginTransaction();
+            try {
+                RawCaptureRecord raw = findRawCapture(db, rawCaptureId);
+                if (raw == null
+                        || raw.status == null
+                        || !RawCaptureRecord.STATUS_PENDING.equals(raw.status)
+                        || raw.merchant == null
+                        || raw.merchant.isEmpty()) {
+                    return false;
+                }
+                long transactionId = findRecentTransactionId(db, raw);
+                if (transactionId < 0) {
+                    return false;
+                }
+                ContentValues values = new ContentValues();
+                values.put("merchant", raw.merchant);
+                values.put("category", raw.category);
+                db.update(
+                        TABLE_TRANSACTIONS,
+                        values,
+                        "id=?",
+                        new String[]{String.valueOf(transactionId)}
+                );
+                markCaptureStatus(db, rawCaptureId, RawCaptureRecord.STATUS_CONFIRMED);
+                db.setTransactionSuccessful();
+                return true;
+            } finally {
+                db.endTransaction();
+            }
+        }
+    }
+
+    private static long findRecentTransactionId(
+            SQLiteDatabase db,
+            RawCaptureRecord raw
+    ) {
+        Cursor cursor = db.query(
+                TABLE_TRANSACTIONS,
+                new String[]{"id"},
+                "source_key=? AND direction=? AND amount_cents=?"
+                        + " AND occurred_at>=? AND occurred_at<=?",
+                new String[]{
+                        raw.sourceKey,
+                        raw.direction,
+                        String.valueOf(raw.amountCents),
+                        String.valueOf(raw.occurredAt - EVIDENCE_MERGE_WINDOW_MS),
+                        String.valueOf(raw.occurredAt + EVIDENCE_MERGE_WINDOW_MS)
+                },
+                null,
+                null,
+                "occurred_at DESC, id DESC",
+                "1"
+        );
+        try {
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(0);
+            }
+            return -1L;
+        } finally {
+            cursor.close();
         }
     }
 

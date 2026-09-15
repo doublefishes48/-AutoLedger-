@@ -4,6 +4,8 @@ import android.annotation.SuppressLint;
 import android.accessibilityservice.AccessibilityService;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -19,6 +21,7 @@ import com.autoledger.app.data.DebugLog;
 import com.autoledger.app.data.LedgerRepository;
 
 import java.util.LinkedHashSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -29,13 +32,35 @@ public class AccessibilityCaptureService extends AccessibilityService {
     private static final String TAG = "AutoLedger";
 
     private static AccessibilityCaptureService runningInstance;
+    private static final long[] RESULT_PROBE_DELAYS = {120L, 380L, 900L};
+    private static final String[] ALIPAY_RESULT_ACTIVITY_MARKERS = {
+            "nfccoderouteractivity", "nrespageactivity", "mspcontaineractivity",
+            "onsitepayactivity", "payresult", "paymentresult", "payresultui"
+    };
+    private static final String[] WECHAT_RESULT_ACTIVITY_MARKERS = {
+            "wallet", "pay", "remittance", "transfer", "liteapp", "transparentliteui",
+            "receipt", "wxpay"
+    };
+    private static final String[] WECHAT_PAYMENT_HINTS = {
+            "支付", "付款", "收款", "交易", "转账", "收款方", "商户", "金额"
+    };
+    private static final String[] UNIONPAY_RESULT_ACTIVITY_MARKERS = {
+            "pay", "payment", "result", "cashier", "order", "trade", "webview",
+            "unionpay", "uppay"
+    };
+    private static final String[] UNIONPAY_PAYMENT_HINTS = {
+            "支付", "付款", "交易", "消费", "金额", "订单", "收银台"
+    };
 
     private static final String[] COMPLETION_MARKERS = {
             "付款成功", "支付成功", "交易成功", "收款成功", "已付款", "支付完成",
-            "到账成功", "退款成功", "支付凭证", "扣款成功"
+            "到账成功", "退款成功", "支付凭证", "扣款成功", "支付结果", "交易结果",
+            "已完成支付", "付款完成"
     };
 
     private ExecutorService executor;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Set<String> scheduledResultProbes = new HashSet<>();
     private WindowManager windowManager;
     private View keepAliveOverlay;
     private boolean overlayAttached;
@@ -45,6 +70,10 @@ public class AccessibilityCaptureService extends AccessibilityService {
         if (service != null) {
             service.syncKeepAliveOverlay(context);
         }
+    }
+
+    public static boolean isRunning() {
+        return runningInstance != null;
     }
 
     @Override
@@ -84,24 +113,84 @@ public class AccessibilityCaptureService extends AccessibilityService {
         String className = event.getClassName() == null
                 ? ""
                 : event.getClassName().toString();
-        String visible = collectVisibleText(packageName);
+        String visible = collectVisibleText(event, packageName);
+        boolean windowChanged = event.getEventType()
+                == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
         if (CapturePackages.PACKAGE_WECHAT.equals(packageName)
-                && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                && windowChanged) {
             DebugLog.append(
                     this,
                     "wechat state class=" + className
                             + " text=" + truncate(visible, 500)
             );
         }
+        if (CapturePackages.PACKAGE_ALIPAY.equals(packageName)
+                && (windowChanged || looksMoneyOrResult(visible))) {
+            DebugLog.append(
+                    this,
+                    "alipay state class=" + className
+                            + " event=" + event.getEventType()
+                            + " text=" + truncate(visible, 600)
+            );
+        }
+        if (CapturePackages.PACKAGE_UNIONPAY.equals(packageName)
+                && (windowChanged || looksMoneyOrResult(visible))) {
+            DebugLog.append(
+                    this,
+                    "unionpay state class=" + className
+                            + " event=" + event.getEventType()
+                            + " text=" + truncate(visible, 600)
+            );
+        }
+
+        if (CapturePackages.PACKAGE_ALIPAY.equals(packageName)
+                && (windowChanged || looksMoneyOrResult(visible))) {
+            scheduleResultProbe(
+                    packageName,
+                    className,
+                    looksMoneyOrResult(visible)
+            );
+        } else if (CapturePackages.PACKAGE_WECHAT.equals(packageName)
+                && (windowChanged
+                || containsAny(visible, WECHAT_PAYMENT_HINTS)
+                || looksMoneyOrResult(visible))) {
+            scheduleResultProbe(
+                    packageName,
+                    className,
+                    containsAny(visible, WECHAT_PAYMENT_HINTS)
+                            || looksMoneyOrResult(visible)
+            );
+        } else if (CapturePackages.PACKAGE_UNIONPAY.equals(packageName)
+                && (windowChanged
+                || containsAny(visible, UNIONPAY_PAYMENT_HINTS)
+                || looksMoneyOrResult(visible))) {
+            scheduleResultProbe(
+                    packageName,
+                    className,
+                    containsAny(visible, UNIONPAY_PAYMENT_HINTS)
+                            || looksMoneyOrResult(visible)
+            );
+        }
 
         if (visible.length() < 6 || !looksCompleted(visible)) {
             return;
         }
-        final String visibleText = visible;
+        captureVisibleText(packageName, className, event.getEventType(), visible);
+    }
+
+    private void captureVisibleText(
+            String packageName,
+            String className,
+            int eventType,
+            String visibleText
+    ) {
+        if (executor == null) {
+            return;
+        }
         Log.d(TAG, "accessibility capture pkg=" + packageName
                 + " text=" + visibleText);
         DebugLog.append(this, "accessibility capture pkg=" + packageName
-                + " type=" + event.getEventType() + " class=" + className
+                + " type=" + eventType + " class=" + className
                 + " text=" + visibleText);
         executor.execute(() -> CaptureRouter.ingest(
                 getApplicationContext(),
@@ -111,6 +200,69 @@ public class AccessibilityCaptureService extends AccessibilityService {
                 visibleText,
                 System.currentTimeMillis()
         ));
+    }
+
+    private void scheduleResultProbe(
+            String packageName,
+            String className,
+            boolean allowGenericProbe
+    ) {
+        boolean wechat = CapturePackages.PACKAGE_WECHAT.equals(packageName);
+        boolean unionpay = CapturePackages.PACKAGE_UNIONPAY.equals(packageName);
+        String lowerClass = className == null
+                ? ""
+                : className.toLowerCase(Locale.ROOT);
+        boolean resultActivity = false;
+        String[] markers = wechat
+                ? WECHAT_RESULT_ACTIVITY_MARKERS
+                : unionpay
+                ? UNIONPAY_RESULT_ACTIVITY_MARKERS
+                : ALIPAY_RESULT_ACTIVITY_MARKERS;
+        for (String marker : markers) {
+            if (lowerClass.contains(marker)) {
+                resultActivity = true;
+                break;
+            }
+        }
+        if (!resultActivity && !allowGenericProbe) {
+            return;
+        }
+
+        long bucket = System.currentTimeMillis() / 1_000L;
+        String probeKey = packageName + "|" + className + "|" + bucket;
+        synchronized (scheduledResultProbes) {
+            if (!scheduledResultProbes.add(probeKey)) {
+                return;
+            }
+        }
+        for (long delay : RESULT_PROBE_DELAYS) {
+            mainHandler.postDelayed(() -> {
+                String visible = collectVisibleText(null, packageName);
+                if (visible.isEmpty()) {
+                    return;
+                }
+                DebugLog.append(
+                        this,
+                        (wechat ? "wechat" : unionpay ? "unionpay" : "alipay")
+                                + " result probe delay=" + delay
+                                + " class=" + className
+                                + " text=" + truncate(visible, 600)
+                );
+                if (looksCompleted(visible)) {
+                    captureVisibleText(
+                            packageName,
+                            className,
+                            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+                            visible
+                    );
+                }
+            }, delay);
+        }
+        mainHandler.postDelayed(() -> {
+            synchronized (scheduledResultProbes) {
+                scheduledResultProbes.remove(probeKey);
+            }
+        }, 1_600L);
     }
 
     @Override
@@ -123,6 +275,7 @@ public class AccessibilityCaptureService extends AccessibilityService {
             runningInstance = null;
         }
         detachKeepAliveOverlay();
+        mainHandler.removeCallbacksAndMessages(null);
         if (executor != null) {
             executor.shutdown();
         }
@@ -188,7 +341,15 @@ public class AccessibilityCaptureService extends AccessibilityService {
     }
 
     private static boolean looksCompleted(String text) {
-        String lower = text.toLowerCase(Locale.ROOT);
+        String compact = text.replaceAll("\\s+", "");
+        String lower = compact.toLowerCase(Locale.ROOT);
+        if (compact.contains("支付失败")
+                || compact.contains("付款失败")
+                || compact.contains("交易失败")
+                || compact.contains("支付已取消")
+                || compact.contains("付款已取消")) {
+            return false;
+        }
         if (lower.contains("payment successful")
                 || lower.contains("payment success")
                 || lower.contains("paid successfully")
@@ -197,11 +358,45 @@ public class AccessibilityCaptureService extends AccessibilityService {
             return true;
         }
         for (String marker : COMPLETION_MARKERS) {
-            if (text.contains(marker)) {
+            if (compact.contains(marker)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static boolean containsAny(String text, String[] words) {
+        if (text == null) {
+            return false;
+        }
+        for (String word : words) {
+            if (text.contains(word)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean looksMoneyOrResult(String text) {
+        if (text == null || text.length() < 4) {
+            return false;
+        }
+        boolean hasAmount = text.contains("¥")
+                || text.contains("￥")
+                || text.contains("元");
+        if (!hasAmount) {
+            return false;
+        }
+        String lower = text.toLowerCase(Locale.ROOT);
+        return lower.contains("success")
+                || text.contains("支付")
+                || text.contains("付款")
+                || text.contains("收款")
+                || text.contains("交易")
+                || text.contains("退款")
+                || text.contains("实付")
+                || text.contains("完成")
+                || text.contains("订单");
     }
 
     private static void addText(Set<String> texts, CharSequence value) {
@@ -224,8 +419,26 @@ public class AccessibilityCaptureService extends AccessibilityService {
         return builder.toString();
     }
 
-    private String collectVisibleText(String eventPackage) {
+    private String collectVisibleText(
+            AccessibilityEvent event,
+            String eventPackage
+    ) {
         Set<String> texts = new LinkedHashSet<>();
+
+        if (event != null) {
+            for (CharSequence text : event.getText()) {
+                addText(texts, text);
+            }
+            addText(texts, event.getContentDescription());
+            AccessibilityNodeInfo source = event.getSource();
+            if (source != null) {
+                try {
+                    collectSupportedRoot(source, texts);
+                } finally {
+                    source.recycle();
+                }
+            }
+        }
 
         AccessibilityNodeInfo activeRoot = getRootInActiveWindow();
         if (activeRoot != null) {

@@ -16,12 +16,18 @@ import java.util.concurrent.Executors;
 
 public class NotificationCaptureService extends NotificationListenerService {
     private static final String TAG = "AutoLedger";
+    private static volatile boolean connected;
 
     private ExecutorService executor;
+
+    public static boolean isConnected() {
+        return connected;
+    }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        connected = false;
         executor = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "autoledger-notification");
             thread.setDaemon(true);
@@ -33,7 +39,15 @@ public class NotificationCaptureService extends NotificationListenerService {
     @Override
     public void onListenerConnected() {
         super.onListenerConnected();
+        connected = true;
         DebugLog.append(this, "notification listener connected");
+    }
+
+    @Override
+    public void onListenerDisconnected() {
+        connected = false;
+        DebugLog.append(this, "notification listener disconnected");
+        super.onListenerDisconnected();
     }
 
     @Override
@@ -76,6 +90,7 @@ public class NotificationCaptureService extends NotificationListenerService {
 
     @Override
     public void onDestroy() {
+        connected = false;
         if (executor != null) {
             executor.shutdown();
         }

@@ -16,7 +16,7 @@ public final class PaymentTextParser {
     );
     private static final Pattern AMOUNT_CONTEXT = Pattern.compile(
             "(?:支付成功|付款成功|交易成功|收款成功|退款成功|退款|消费|支出|付款|收款|到账|转入|收入|收到)"
-                    + "[^0-9]{0,18}?([0-9]{1,9}(?:\\.[0-9]{1,2})?)(?:\\s*元)?"
+                    + "[^0-9]{0,18}?([0-9]{1,9}(?:\\.[0-9]{1,2})?)(?:\\s*(?:元|块(?:钱)?))"
     );
 
     private static final String[] STRONG_INCOME_WORDS = {
@@ -27,12 +27,23 @@ public final class PaymentTextParser {
     private static final String[] HARD_IGNORE_WORDS = {
             "最高", "立减", "立减券", "优惠券", "代金券", "抽奖", "点我抽奖", "待领取",
             "今晚失效", "即将失效", "积分兑", "会员中心", "任务达标", "抽取", "领券",
-            "红包", "点击领取", "免费领取", "无门槛券"
+            "红包", "点击领取", "免费领取", "无门槛券", "支付失败", "付款失败",
+            "交易失败", "支付已取消", "付款已取消", "免单券", "优惠待领取",
+            "待支付", "待付款", "摇一摇", "抽奖机会", "立减券", "任务达标"
     };
     private static final String[] KNOWN_FOOD_MERCHANTS = {
             "瑞幸咖啡", "luckincoffee瑞幸咖啡", "蜜雪冰城", "幸运咖", "星巴克", "麦当劳",
             "肯德基", "汉堡王", "塔斯汀", "喜茶", "奈雪的茶", "茶百道", "古茗", "瑞幸",
             "书亦烧仙草", "霸王茶姬", "一点点", "沪上阿姨", "益禾堂", "coco都可"
+    };
+    private static final String[] PRODUCT_PAGE_WORDS = {
+            "特价团", "已售", "加倍补", "购买须知", "团购详情", "商品详情",
+            "购买团购券", "团购券", "券后", "限时抢购"
+    };
+    private static final String[] BROWSING_PAGE_WORDS = {
+            "交易详情", "账单详情", "交易单号", "商户单号", "支付时间",
+            "当前状态", "收单机构", "申请电子凭证", "点击查看全部消息",
+            "全部会话", "消息盒子", "使用零钱支付", "使用零钱通支付"
     };
 
     private PaymentTextParser() {
@@ -60,7 +71,7 @@ public final class PaymentTextParser {
         boolean officialTitle = isOfficialLedgerTitle(title);
         boolean paymentSignal = refund || income || expense || officialTitle;
         String knownMerchant = knownMerchant(joined, title);
-        if (shouldIgnore(joined, knownMerchant)) {
+        if (shouldIgnore(joined, knownMerchant, channel)) {
             return null;
         }
 
@@ -133,12 +144,30 @@ public final class PaymentTextParser {
 
     private static boolean shouldIgnore(
             String text,
-            String knownMerchant
+            String knownMerchant,
+            String channel
     ) {
-        if (knownMerchant != null && !knownMerchant.isEmpty()) {
+        boolean explicitSuccess = containsAny(
+                text,
+                "支付成功", "付款成功", "交易成功", "支付完成", "付款完成",
+                "已完成支付"
+        );
+        if (CaptureChannel.ACCESSIBILITY.equals(channel)) {
+            String compact = text.replaceAll("\\s+", "");
+            if (containsAny(text, BROWSING_PAGE_WORDS)
+                    || compact.contains("首页理财")
+                    || compact.contains("消息我的")
+                    || compact.contains("分钟前")
+                    || compact.contains("小时前")
+                    || compact.contains("天前")) {
+                return true;
+            }
+        }
+        boolean productPage = containsAny(text, PRODUCT_PAGE_WORDS);
+        if (explicitSuccess && !productPage) {
             return false;
         }
-        if (!containsAny(text, HARD_IGNORE_WORDS)) {
+        if (!containsAny(text, HARD_IGNORE_WORDS) && !productPage) {
             return false;
         }
         if (containsAny(
@@ -149,8 +178,8 @@ public final class PaymentTextParser {
         }
         if (containsAny(
                 text,
-                "支付成功", "付款成功", "交易成功", "收款成功", "退款成功",
-                "消费", "支出", "退款"
+                "收款成功", "退款成功", "你有一笔", "消费", "支出", "退款",
+                "已付款", "已支付", "扣款成功"
         ) && !containsAny(
                 text,
                 "最高", "立减", "立减券", "优惠券", "代金券", "抽奖",
@@ -188,11 +217,18 @@ public final class PaymentTextParser {
     }
 
     private static boolean hasExpenseSignal(String text) {
+        String compact = text.replaceAll("\\s+", "");
         return containsAny(
                 text,
                 "支付成功", "付款成功", "交易成功", "支付完成", "支付了", "已支付",
                 "已付款", "扣款成功", "扣款", "消费", "支出", "付款给",
-                "微信支付", "购买成功"
+                "微信支付", "购买成功", "支付结果", "交易结果", "已完成支付",
+                "付款完成"
+        )
+                || containsAny(
+                compact,
+                "支付成功", "付款成功", "交易成功", "支付完成", "已完成支付",
+                "付款完成", "支付结果", "交易结果"
         )
                 || Pattern.compile("向\\s*(?!你|您)[^\\s，。]+\\s*(?:付款|支付)")
                 .matcher(text)
@@ -200,11 +236,17 @@ public final class PaymentTextParser {
     }
 
     private static boolean hasIncomeSignal(String text) {
-        return containsAny(text, STRONG_INCOME_WORDS);
+        String compact = text.replaceAll("\\s+", "");
+        return containsAny(text, STRONG_INCOME_WORDS)
+                || containsAny(
+                compact,
+                "成功收款", "收款成功", "收到转账", "红包到账", "转账到账",
+                "到账成功", "向你付款", "向您付款"
+        );
     }
 
     private static boolean hasRefundSignal(String text, String title) {
-        return containsAny(text, "退款", "返现", "退货退款")
+        return containsAny(text.replaceAll("\\s+", ""), "退款", "返现", "退货退款")
                 || title != null && title.contains("退款");
     }
 
@@ -216,7 +258,7 @@ public final class PaymentTextParser {
                 title,
                 "微信支付", "微信收款", "微信到账", "支付宝到账", "支付助手",
                 "交易提醒", "付款提醒", "退款提醒", "账单", "付款成功", "收款成功",
-                "支付成功", "交易成功", "退款"
+                "支付成功", "交易成功", "支付结果", "交易结果", "退款"
         );
     }
 
@@ -264,11 +306,6 @@ public final class PaymentTextParser {
             String text,
             String direction
     ) {
-        String known = knownMerchant(text, title);
-        if (!known.isEmpty()) {
-            return known;
-        }
-
         Pattern[] patterns = LedgerEntry.DIRECTION_EXPENSE.equals(direction)
                 ? expenseMerchantPatterns()
                 : incomeMerchantPatterns();
@@ -279,6 +316,81 @@ public final class PaymentTextParser {
                 if (isUsefulMerchant(merchant, sourceKey)) {
                     return merchant;
                 }
+            }
+        }
+
+        String[] tokens = text.split("\\s+");
+        String nearestBeforeStatus = nearestMerchantBeforeStatus(tokens, sourceKey);
+        if (!nearestBeforeStatus.isEmpty()) {
+            return nearestBeforeStatus;
+        }
+        int statusIndex = -1;
+        int amountIndex = -1;
+        StringBuilder statusBuilder = new StringBuilder();
+        for (int i = 0; i < tokens.length; i++) {
+            statusBuilder.append(tokens[i].replaceAll("\\s+", ""));
+            if (statusIndex < 0
+                    && containsAny(
+                    statusBuilder.toString(),
+                    "支付成功", "付款成功", "交易成功", "支付结果", "交易结果",
+                    "退款成功", "收款成功"
+            )) {
+                statusIndex = i;
+            }
+            if (amountIndex < 0
+                    && (AMOUNT_SYMBOL.matcher(tokens[i]).find()
+                    || AMOUNT_YUAN.matcher(tokens[i]).find()
+                    || (i > 0
+                    && containsAny(tokens[i - 1], "¥", "￥")
+                    && tokens[i].matches("[0-9]{1,9}(?:\\.[0-9]{1,2})?")))) {
+                amountIndex = i;
+            }
+        }
+        if (statusIndex >= 0 && amountIndex > statusIndex + 1) {
+            for (int i = statusIndex + 1; i < amountIndex; i++) {
+                String merchant = cleanMerchant(tokens[i]);
+                if (isUsefulMerchant(merchant, sourceKey)) {
+                    return merchant;
+                }
+            }
+        }
+        String known = knownMerchant(text, title);
+        if (!known.isEmpty()) {
+            return known;
+        }
+        for (String token : tokens) {
+            String merchant = cleanMerchant(token);
+            if (isUsefulMerchant(merchant, sourceKey)) {
+                return merchant;
+            }
+        }
+        return "";
+    }
+
+    private static String nearestMerchantBeforeStatus(
+            String[] tokens,
+            String sourceKey
+    ) {
+        StringBuilder compact = new StringBuilder();
+        int statusIndex = -1;
+        for (int i = 0; i < tokens.length; i++) {
+            compact.append(tokens[i].replaceAll("\\s+", ""));
+            if (containsAny(
+                    compact.toString(),
+                    "支付成功", "付款成功", "交易成功", "支付完成", "付款完成",
+                    "已完成支付"
+            )) {
+                statusIndex = i;
+                break;
+            }
+        }
+        if (statusIndex < 0) {
+            return "";
+        }
+        for (int i = statusIndex - 1; i >= 0; i--) {
+            String merchant = cleanMerchant(tokens[i]);
+            if (isUsefulMerchant(merchant, sourceKey)) {
+                return merchant;
             }
         }
         return "";
@@ -351,6 +463,16 @@ public final class PaymentTextParser {
                 && merchant.contains("微信支付"))
                 || merchant.contains("支付助手")
                 || merchant.contains("支付宝")) {
+            return false;
+        }
+        if (containsAny(
+                merchant,
+                "支付成功", "付款成功", "交易成功", "支付结果", "交易结果",
+                "支付", "付款", "交易", "成功", "失败", "返回", "回首页",
+                "完成", "关闭", "首页", "更多", "取消", "商家", "全部会话",
+                "消息盒子", "消息", "我的", "全部", "收付款", "扫一扫", "卡包",
+                "出行", "通讯录", "群福利", "红包", "转账"
+        )) {
             return false;
         }
         return true;
@@ -442,6 +564,14 @@ public final class PaymentTextParser {
         }
         if (paymentSignal) {
             score += 0.22;
+        }
+        if (CaptureChannel.ACCESSIBILITY.equals(channel)
+                && containsAny(
+                text,
+                "支付成功", "付款成功", "交易成功", "支付完成", "付款完成",
+                "已完成支付", "支付结果", "交易结果"
+        )) {
+            score += 0.10;
         }
         if (title != null && !title.trim().isEmpty()) {
             score += 0.04;

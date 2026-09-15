@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.ComponentName;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -202,7 +203,12 @@ public class MainActivity extends Activity {
         LinearLayout copy = new LinearLayout(this);
         copy.setOrientation(LinearLayout.VERTICAL);
         TextView title = text("自动记账", 28, true, COLOR_INK);
-        TextView subtitle = text("本地流水 · 不上传", 13, false, COLOR_MUTED);
+        TextView subtitle = text(
+                "本地流水 · 不上传 · V" + appVersion(),
+                13,
+                false,
+                COLOR_MUTED
+        );
         copy.addView(title);
         copy.addView(subtitle);
         header.addView(copy, weightParams(1));
@@ -218,6 +224,15 @@ public class MainActivity extends Activity {
 
     private String monthLabel() {
         return new SimpleDateFormat("M月", Locale.CHINA).format(new Date());
+    }
+
+    private String appVersion() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            return info.versionName == null ? "未知" : info.versionName;
+        } catch (Exception ignored) {
+            return "未知";
+        }
     }
 
     private View summaryPanel() {
@@ -349,16 +364,31 @@ public class MainActivity extends Activity {
             LinearLayout buttons = row();
             buttons.setPadding(0, dp(10), 0, 0);
             Button confirm = button("确认", COLOR_PRIMARY);
+            Button overwrite = button("覆盖", COLOR_ACTION_IMPORT);
             Button ignore = button("忽略", COLOR_ACTION_REFRESH);
             confirm.setOnClickListener(v -> {
                 repository.confirmRawCapture(raw.id);
                 render();
+            });
+            overwrite.setOnClickListener(v -> {
+                if (repository.overwriteRecentTransaction(raw.id)) {
+                    render();
+                } else {
+                    Toast.makeText(
+                            this,
+                            "没有找到可覆盖的近期流水",
+                            Toast.LENGTH_SHORT
+                    ).show();
+                }
             });
             ignore.setOnClickListener(v -> {
                 repository.ignoreRawCapture(raw.id);
                 render();
             });
             buttons.addView(confirm, weightParams(1));
+            if (repository.canOverwriteRecentTransaction(raw)) {
+                buttons.addView(overwrite, weightParams(1));
+            }
             buttons.addView(ignore, weightParams(1));
             card.addView(buttons);
             content.addView(card, cardParams());
@@ -381,9 +411,9 @@ public class MainActivity extends Activity {
             LinearLayout info = new LinearLayout(this);
             info.setOrientation(LinearLayout.VERTICAL);
             String prefix = entry.isExpense() ? "-" : "+";
-            String merchantLabel = entry.merchant == null || entry.merchant.isEmpty()
-                    ? "自动记录"
-                    : entry.merchant;
+            String categoryLabel = CategoryCatalog.label(entry.category);
+            boolean hasMerchant = entry.merchant != null && !entry.merchant.isEmpty();
+            String merchantLabel = hasMerchant ? entry.merchant : categoryLabel;
             TextView title = text(
                     merchantLabel,
                     15,
@@ -399,8 +429,8 @@ public class MainActivity extends Activity {
                     ? ""
                     : " · " + entry.account;
             TextView detail = text(
-                    CategoryCatalog.label(entry.category)
-                            + " · " + dateFormat.format(new Date(entry.occurredAt))
+                    (hasMerchant ? categoryLabel + " · " : "")
+                            + dateFormat.format(new Date(entry.occurredAt))
                             + " · " + source + accountSuffix,
                     12,
                     false,
