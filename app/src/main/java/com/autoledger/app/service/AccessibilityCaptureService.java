@@ -3,10 +3,13 @@ package com.autoledger.app.service;
 import android.annotation.SuppressLint;
 import android.accessibilityservice.AccessibilityService;
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -19,6 +22,10 @@ import com.autoledger.app.capture.CapturePackages;
 import com.autoledger.app.capture.CaptureRouter;
 import com.autoledger.app.data.DebugLog;
 import com.autoledger.app.data.LedgerRepository;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 
 import java.util.LinkedHashSet;
 import java.util.HashSet;
@@ -51,6 +58,11 @@ public class AccessibilityCaptureService extends AccessibilityService {
     private static final String[] UNIONPAY_PAYMENT_HINTS = {
             "支付", "付款", "交易", "消费", "金额", "订单", "收银台"
     };
+    private static final String[] OCR_BROWSING_MARKERS = {
+            "交易详情", "账单详情", "交易单号", "商户单号", "支付时间",
+            "当前状态", "收单机构", "申请电子凭证", "点击查看全部消息",
+            "全部会话", "消息盒子", "使用零钱支付", "使用零钱通支付"
+    };
 
     private static final String[] COMPLETION_MARKERS = {
             "付款成功", "支付成功", "交易成功", "收款成功", "已付款", "支付完成",
@@ -61,9 +73,17 @@ public class AccessibilityCaptureService extends AccessibilityService {
     private ExecutorService executor;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Set<String> scheduledResultProbes = new HashSet<>();
+    private TextRecognizer textRecognizer;
     private WindowManager windowManager;
     private View keepAliveOverlay;
     private boolean overlayAttached;
+    private volatile boolean ocrInFlight;
+    private volatile boolean ocrSuccessForFlow;
+    private volatile String lastForegroundPackage;
+    private volatile long lastForegroundEventAt;
+    private volatile long lastVisualCaptureAt;
+    private volatile long lastWechatPaymentSignalAt;
+    private volatile long lastWechatOcrScheduleAt;
 
     public static void refreshKeepAliveOverlay(Context context) {
         AccessibilityCaptureService service = runningInstance;
@@ -85,6 +105,9 @@ public class AccessibilityCaptureService extends AccessibilityService {
             return thread;
         });
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        textRecognizer = TextRecognition.getClient(
+                new ChineseTextRecognizerOptions.Builder().build()
+        );
     }
 
     @Override
@@ -109,6 +132,9 @@ public class AccessibilityCaptureService extends AccessibilityService {
         if (!CapturePackages.supportsAccessibility(packageName)) {
             return;
         }
+        long eventAt = System.currentTimeMillis();
+        lastForegroundPackage = packageName;
+        lastForegroundEventAt = eventAt;
 
         String className = event.getClassName() == null
                 ? ""
@@ -171,6 +197,10 @@ public class AccessibilityCaptureService extends AccessibilityService {
                             || looksMoneyOrResult(visible)
             );
         }
+        if (CapturePackages.PACKAGE_WECHAT.equals(packageName)
+                && isWechatPaymentInterface(className, visible)) {
+            scheduleWechatOcrFallback(className);
+        }
 
         if (visible.length() < 6 || !looksCompleted(visible)) {
             return;
@@ -187,6 +217,7 @@ public class AccessibilityCaptureService extends AccessibilityService {
         if (executor == null) {
             return;
         }
+        lastVisualCaptureAt = System.currentTimeMillis();
         Log.d(TAG, "accessibility capture pkg=" + packageName
                 + " text=" + visibleText);
         DebugLog.append(this, "accessibility capture pkg=" + packageName
@@ -265,6 +296,192 @@ public class AccessibilityCaptureService extends AccessibilityService {
         }, 1_600L);
     }
 
+    private static boolean isWechatPaymentInterface(
+            String className,
+            String visible
+    ) {
+        String compact = visible == null
+                ? ""
+                : visible.replaceAll("\\s+", "");
+        if (containsAny(compact, OCR_BROWSING_MARKERS)) {
+            return false;
+        }
+        if (compact.contains("微信支付")) {
+            return true;
+        }
+        String lowerClass = className == null
+                ? ""
+                : className.toLowerCase(Locale.ROOT);
+        boolean paymentClass = lowerClass.contains("walletpay")
+                || lowerClass.contains("mallwalletpay")
+                || lowerClass.contains("payresult")
+                || lowerClass.contains("wxpayentry")
+                || lowerClass.contains("remittance");
+        return paymentClass
+                && (compact.isEmpty()
+                || compact.contains("支付")
+                || compact.contains("付款"));
+    }
+
+    private void scheduleWechatOcrFallback(String className) {
+        long now = System.currentTimeMillis();
+        if (now - lastWechatOcrScheduleAt < 12_000L) {
+            return;
+        }
+        lastWechatOcrScheduleAt = now;
+        lastWechatPaymentSignalAt = now;
+        ocrSuccessForFlow = false;
+        mainHandler.postDelayed(
+                () -> attemptWechatOcr(className, false),
+                1_200L
+        );
+        mainHandler.postDelayed(
+                () -> attemptWechatOcr(className, true),
+                3_200L
+        );
+    }
+
+    private void attemptWechatOcr(String className, boolean finalAttempt) {
+        if (ocrSuccessForFlow
+                || lastVisualCaptureAt >= lastWechatPaymentSignalAt
+                || System.currentTimeMillis() - lastWechatPaymentSignalAt > 7_000L
+                || !isWechatForeground()
+                || ocrInFlight) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || textRecognizer == null) {
+            if (finalAttempt) {
+                CaptureFallbackNotifier.show(this);
+            }
+            return;
+        }
+        ocrInFlight = true;
+        try {
+            takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    getMainExecutor(),
+                    new AccessibilityService.TakeScreenshotCallback() {
+                        @Override
+                        public void onSuccess(AccessibilityService.ScreenshotResult screenshot) {
+                            processOcrScreenshot(screenshot, className, finalAttempt);
+                        }
+
+                        @Override
+                        public void onFailure(int errorCode) {
+                            ocrInFlight = false;
+                            DebugLog.append(
+                                    AccessibilityCaptureService.this,
+                                    "wechat ocr screenshot failed error=" + errorCode
+                            );
+                            if (finalAttempt) {
+                                CaptureFallbackNotifier.show(
+                                        AccessibilityCaptureService.this
+                                );
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable error) {
+            ocrInFlight = false;
+            DebugLog.append(this, "wechat ocr screenshot exception " + error);
+            if (finalAttempt) {
+                CaptureFallbackNotifier.show(this);
+            }
+        }
+    }
+
+    private void processOcrScreenshot(
+            AccessibilityService.ScreenshotResult screenshot,
+            String className,
+            boolean finalAttempt
+    ) {
+        Bitmap bitmap = null;
+        try {
+            android.hardware.HardwareBuffer buffer = screenshot.getHardwareBuffer();
+            Bitmap hardwareBitmap = Bitmap.wrapHardwareBuffer(
+                    buffer,
+                    screenshot.getColorSpace()
+            );
+            if (hardwareBitmap != null) {
+                bitmap = hardwareBitmap.copy(Bitmap.Config.ARGB_8888, false);
+            }
+            buffer.close();
+        } catch (Throwable error) {
+            DebugLog.append(this, "wechat ocr bitmap failed " + error);
+        }
+        if (bitmap == null) {
+            ocrInFlight = false;
+            if (finalAttempt) {
+                CaptureFallbackNotifier.show(this);
+            }
+            return;
+        }
+        final Bitmap recognizedBitmap = bitmap;
+
+        TextRecognizer recognizer = textRecognizer;
+        if (recognizer == null) {
+            recognizedBitmap.recycle();
+            ocrInFlight = false;
+            return;
+        }
+        recognizer.process(InputImage.fromBitmap(recognizedBitmap, 0))
+                .addOnSuccessListener(getMainExecutor(), text -> {
+                    String ocrText = text.getText().trim();
+                    DebugLog.append(
+                            this,
+                            "wechat ocr class=" + className
+                                    + " chars=" + ocrText.length()
+                                    + " success=" + looksCompleted(ocrText)
+                                    + " money=" + looksMoneyOrResult(ocrText)
+                    );
+                    boolean browsing = containsAny(
+                            ocrText.replaceAll("\\s+", ""),
+                            OCR_BROWSING_MARKERS
+                    );
+                    if (ocrText.isEmpty() || browsing) {
+                        ocrInFlight = false;
+                        recognizedBitmap.recycle();
+                        if (finalAttempt && !browsing) {
+                            CaptureFallbackNotifier.show(this);
+                        }
+                        return;
+                    }
+                    executor.execute(() -> {
+                        int result = CaptureRouter.ingest(
+                                getApplicationContext(),
+                                CapturePackages.PACKAGE_WECHAT,
+                                CaptureChannel.OCR,
+                                null,
+                                ocrText,
+                                System.currentTimeMillis()
+                        );
+                        ocrInFlight = false;
+                        recognizedBitmap.recycle();
+                        if (result != CaptureRouter.RESULT_IGNORED) {
+                            lastVisualCaptureAt = System.currentTimeMillis();
+                            ocrSuccessForFlow = true;
+                        } else if (finalAttempt) {
+                            CaptureFallbackNotifier.show(
+                                    AccessibilityCaptureService.this
+                            );
+                        }
+                    });
+                })
+                .addOnFailureListener(getMainExecutor(), error -> {
+                    ocrInFlight = false;
+                    recognizedBitmap.recycle();
+                    DebugLog.append(this, "wechat ocr failed " + error);
+                    if (finalAttempt) {
+                        CaptureFallbackNotifier.show(this);
+                    }
+                });
+    }
+
+    private boolean isWechatForeground() {
+        return CapturePackages.PACKAGE_WECHAT.equals(lastForegroundPackage)
+                && System.currentTimeMillis() - lastForegroundEventAt < 5_000L;
+    }
+
     @Override
     public void onInterrupt() {
     }
@@ -276,6 +493,10 @@ public class AccessibilityCaptureService extends AccessibilityService {
         }
         detachKeepAliveOverlay();
         mainHandler.removeCallbacksAndMessages(null);
+        if (textRecognizer != null) {
+            textRecognizer.close();
+            textRecognizer = null;
+        }
         if (executor != null) {
             executor.shutdown();
         }

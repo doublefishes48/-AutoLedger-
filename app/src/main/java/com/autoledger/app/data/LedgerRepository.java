@@ -83,6 +83,41 @@ public final class LedgerRepository {
         return result;
     }
 
+    public List<LedgerEntry> transactionsForMonth(Calendar month, int limit) {
+        long[] bounds = monthBounds(month);
+        return transactionsForRange(bounds[0], bounds[1], limit);
+    }
+
+    public List<LedgerEntry> transactionsForDay(Calendar day, int limit) {
+        long[] bounds = dayBounds(day);
+        return transactionsForRange(bounds[0], bounds[1], limit);
+    }
+
+    private List<LedgerEntry> transactionsForRange(long start, long end, int limit) {
+        List<LedgerEntry> result = new ArrayList<>();
+        synchronized (database) {
+            SQLiteDatabase db = database.getReadableDatabase();
+            Cursor cursor = db.rawQuery(
+                    "SELECT * FROM " + TABLE_TRANSACTIONS
+                            + " WHERE occurred_at>=? AND occurred_at<?"
+                            + " ORDER BY occurred_at DESC, id DESC LIMIT ?",
+                    new String[]{
+                            String.valueOf(start),
+                            String.valueOf(end),
+                            String.valueOf(limit)
+                    }
+            );
+            try {
+                while (cursor.moveToNext()) {
+                    result.add(readTransaction(cursor));
+                }
+            } finally {
+                cursor.close();
+            }
+        }
+        return result;
+    }
+
     public List<RawCaptureRecord> pendingCaptures() {
         List<RawCaptureRecord> result = new ArrayList<>();
         synchronized (database) {
@@ -109,16 +144,20 @@ public final class LedgerRepository {
     }
 
     public Summary loadSummary() {
-        Calendar calendar = Calendar.getInstance();
-        calendar.set(Calendar.HOUR_OF_DAY, 0);
-        calendar.set(Calendar.MINUTE, 0);
-        calendar.set(Calendar.SECOND, 0);
-        calendar.set(Calendar.MILLISECOND, 0);
-        calendar.set(Calendar.DAY_OF_MONTH, 1);
-        long start = calendar.getTimeInMillis();
-        calendar.add(Calendar.MONTH, 1);
-        long end = calendar.getTimeInMillis();
+        return loadSummary(Calendar.getInstance());
+    }
 
+    public Summary loadSummary(Calendar month) {
+        long[] bounds = monthBounds(month);
+        return loadSummaryRange(bounds[0], bounds[1]);
+    }
+
+    public Summary loadDaySummary(Calendar day) {
+        long[] bounds = dayBounds(day);
+        return loadSummaryRange(bounds[0], bounds[1]);
+    }
+
+    private Summary loadSummaryRange(long start, long end) {
         Summary summary = new Summary();
         synchronized (database) {
             SQLiteDatabase db = database.getReadableDatabase();
@@ -152,6 +191,29 @@ public final class LedgerRepository {
             }
         }
         return summary;
+    }
+
+    private static long[] monthBounds(Calendar source) {
+        Calendar calendar = (Calendar) source.clone();
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        calendar.set(Calendar.DAY_OF_MONTH, 1);
+        long start = calendar.getTimeInMillis();
+        calendar.add(Calendar.MONTH, 1);
+        return new long[]{start, calendar.getTimeInMillis()};
+    }
+
+    private static long[] dayBounds(Calendar source) {
+        Calendar calendar = (Calendar) source.clone();
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        long start = calendar.getTimeInMillis();
+        calendar.add(Calendar.DAY_OF_MONTH, 1);
+        return new long[]{start, calendar.getTimeInMillis()};
     }
 
     public void addManualTransaction(
@@ -339,6 +401,10 @@ public final class LedgerRepository {
         )) {
             return "large_expense";
         }
+        if (CaptureChannel.ACCESSIBILITY.equals(result.channel)
+                && isAwaitingRecipientConfirmation(result.rawText)) {
+            return "awaiting_recipient_confirmation";
+        }
         if (isSuspiciousMerchant(result.merchant)) {
             return "suspicious_merchant";
         }
@@ -353,6 +419,18 @@ public final class LedgerRepository {
             return "recent_duplicate";
         }
         return null;
+    }
+
+    static boolean isAwaitingRecipientConfirmation(String text) {
+        if (text == null) {
+            return false;
+        }
+        String compact = text.replaceAll("\\s+", "");
+        return compact.contains("确认收款")
+                || compact.contains("等待对方确认")
+                || compact.contains("待对方确认")
+                || compact.contains("待入账")
+                || compact.contains("处理中");
     }
 
     static boolean exceedsHistoricalExpenseMaximum(

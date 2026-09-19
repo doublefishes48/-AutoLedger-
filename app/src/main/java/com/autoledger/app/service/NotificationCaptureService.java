@@ -41,6 +41,26 @@ public class NotificationCaptureService extends NotificationListenerService {
         super.onListenerConnected();
         connected = true;
         DebugLog.append(this, "notification listener connected");
+        executor.execute(() -> {
+            try {
+                StatusBarNotification[] active = getActiveNotifications();
+                if (active == null || active.length == 0) {
+                    return;
+                }
+                int replayed = 0;
+                for (StatusBarNotification sbn : active) {
+                    if (sbn != null && CapturePackages.supportsNotification(sbn.getPackageName())) {
+                        enqueueNotification(sbn);
+                        replayed++;
+                    }
+                }
+                if (replayed > 0) {
+                    DebugLog.append(this, "notification listener replayed active=" + replayed);
+                }
+            } catch (Throwable error) {
+                DebugLog.append(this, "notification listener replay failed " + error);
+            }
+        });
     }
 
     @Override
@@ -52,6 +72,10 @@ public class NotificationCaptureService extends NotificationListenerService {
 
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
+        enqueueNotification(sbn);
+    }
+
+    private void enqueueNotification(StatusBarNotification sbn) {
         if (sbn == null) {
             return;
         }

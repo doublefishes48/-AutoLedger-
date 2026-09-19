@@ -31,4 +31,18 @@ public class LedgerRepositoryTest {
         assertTrue(LedgerRepository.isSuspiciousMerchant("¥10.00"));
         assertFalse(LedgerRepository.isSuspiciousMerchant("塔斯汀"));
     }
+
+    @Test
+    public void transferAwaitingRecipientConfirmationRequiresReview() {
+        assertTrue(
+                LedgerRepository.isAwaitingRecipientConfirmation(
+                        "支付成功 待饮水确认收款 ￥14.00 完成"
+                )
+        );
+        assertFalse(
+                LedgerRepository.isAwaitingRecipientConfirmation(
+                        "支付成功 亿印图文设计店 ￥0.40 返回商家"
+                )
+        );
+    }
 }

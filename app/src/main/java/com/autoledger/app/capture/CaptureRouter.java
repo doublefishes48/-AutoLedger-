@@ -27,8 +27,16 @@ public final class CaptureRouter {
         RecognitionResult parsed = PaymentTextParser.parse(packageName, channel, title, text, occurredAt);
         if (parsed == null) {
             Log.d(TAG, "ingest ignored channel=" + channel + " pkg=" + packageName + " title=" + title + " text=" + text);
-            DebugLog.append(context, "ingest ignored channel=" + channel + " pkg=" + packageName
-                    + " title=" + title + " text=" + text);
+            if (CaptureChannel.OCR.equals(channel)) {
+                DebugLog.append(
+                        context,
+                        "ingest ignored channel=OCR pkg=" + packageName
+                                + " chars=" + (text == null ? 0 : text.length())
+                );
+            } else {
+                DebugLog.append(context, "ingest ignored channel=" + channel + " pkg=" + packageName
+                        + " title=" + title + " text=" + text);
+            }
             return RESULT_IGNORED;
         }
         int result = LedgerRepository.get(context).ingestCapture(parsed);

@@ -6,10 +6,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Build;
 import android.os.IBinder;
+import android.content.pm.ServiceInfo;
 
 import com.autoledger.app.data.DebugLog;
 import com.autoledger.app.data.LedgerRepository;
@@ -22,13 +25,20 @@ public class KeepAliveService extends Service {
     private static final String CHANNEL_ID = "autoledger_keepalive";
     private static final int NOTIFICATION_ID = 1;
     private static final int GUARD_REQUEST_CODE = 2401;
-    private static final long GUARD_DELAY_MS = 60_000L;
-    private static final long GUARD_INTERVAL_MS = 5L * 60L * 1000L;
+    static final long GUARD_DELAY_MS = 30_000L;
+    static final long GUARD_INTERVAL_MS = 5L * 60L * 1000L;
     private static final long WATCHDOG_DELAY_MS = 45L * 1000L;
-    private static final long WATCHDOG_INTERVAL_MS = 60L * 1000L;
+    private static final long WATCHDOG_INTERVAL_MS = 30L * 1000L;
     public static final String ACTION_GUARD = "com.autoledger.app.action.SERVICE_GUARD";
 
     private ScheduledExecutorService worker;
+    private final BroadcastReceiver wakeGuardReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            ServiceGuard.run(KeepAliveService.this);
+            scheduleGuard(KeepAliveService.this, GUARD_INTERVAL_MS);
+        }
+    };
 
     public static void start(Context context) {
         try {
@@ -65,8 +75,9 @@ public class KeepAliveService extends Service {
                 .setDefaults(0)
                 .setOngoing(true)
                 .build();
-        startForeground(NOTIFICATION_ID, notification);
-        scheduleGuard();
+        startForegroundCompat(notification);
+        registerWakeGuardReceiver();
+        scheduleGuard(this, GUARD_DELAY_MS);
         worker.execute(() -> ServiceGuard.run(this));
         worker.scheduleWithFixedDelay(
                 () -> {
@@ -84,6 +95,7 @@ public class KeepAliveService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        scheduleGuard(this, GUARD_DELAY_MS);
         return START_STICKY;
     }
 
@@ -93,40 +105,75 @@ public class KeepAliveService extends Service {
     }
 
     @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        scheduleGuard(this, GUARD_INTERVAL_MS);
+        if (worker != null) {
+            worker.execute(() -> ServiceGuard.run(this));
+        }
+        super.onTaskRemoved(rootIntent);
+    }
+
+    @Override
     public void onDestroy() {
+        try {
+            unregisterReceiver(wakeGuardReceiver);
+        } catch (Throwable ignored) {
+        }
         if (worker != null) {
             worker.shutdown();
         }
+        scheduleGuard(this, GUARD_INTERVAL_MS);
         super.onDestroy();
     }
 
-    private void scheduleGuard() {
+    static void scheduleGuard(Context context, long delayMs) {
         try {
-            AlarmManager alarmManager = getSystemService(AlarmManager.class);
-            Intent intent = new Intent(this, ServiceGuardReceiver.class)
+            AlarmManager alarmManager = context.getSystemService(AlarmManager.class);
+            Intent intent = new Intent(context, ServiceGuardReceiver.class)
                     .setAction(ACTION_GUARD);
             PendingIntent pending = PendingIntent.getBroadcast(
-                    this,
+                    context,
                     GUARD_REQUEST_CODE,
                     intent,
                     PendingIntent.FLAG_UPDATE_CURRENT
                             | PendingIntent.FLAG_IMMUTABLE
             );
-            long trigger = System.currentTimeMillis() + GUARD_DELAY_MS;
+            long trigger = System.currentTimeMillis() + delayMs;
             if (alarmManager != null) {
                 alarmManager.setAndAllowWhileIdle(
                         AlarmManager.RTC_WAKEUP,
                         trigger,
                         pending
                 );
-                alarmManager.setInexactRepeating(
-                        AlarmManager.RTC_WAKEUP,
-                        trigger,
-                        GUARD_INTERVAL_MS,
-                        pending
-                );
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    private void startForegroundCompat(Notification notification) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            );
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
+    }
+
+    private void registerWakeGuardReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                    wakeGuardReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+            );
+        } else {
+            registerReceiver(wakeGuardReceiver, filter);
         }
     }
 

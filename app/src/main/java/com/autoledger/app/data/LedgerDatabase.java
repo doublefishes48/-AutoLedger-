@@ -6,7 +6,7 @@ import android.database.sqlite.SQLiteOpenHelper;
 
 public final class LedgerDatabase extends SQLiteOpenHelper {
     private static final String DB_NAME = "autoledger.db";
-    private static final int DB_VERSION = 10;
+    private static final int DB_VERSION = 11;
     private static volatile LedgerDatabase instance;
 
     public static final String TABLE_TRANSACTIONS = "transactions";
@@ -118,6 +118,9 @@ public final class LedgerDatabase extends SQLiteOpenHelper {
         }
         if (oldVersion < 10) {
             purgeAlipayEvidenceDuplicates(db);
+        }
+        if (oldVersion < 11) {
+            restorePendingWechatTransfers(db);
         }
         db.execSQL(
                 "CREATE INDEX IF NOT EXISTS idx_transactions_source_ref ON " + TABLE_TRANSACTIONS
@@ -352,5 +355,32 @@ public final class LedgerDatabase extends SQLiteOpenHelper {
                         + ")"
         );
         dedupeSameDayExactHistory(db);
+    }
+
+    private static void restorePendingWechatTransfers(SQLiteDatabase db) {
+        String pendingTransfer =
+                "("
+                        + "raw_text LIKE '%确认收款%'"
+                        + " OR raw_text LIKE '%等待对方确认%'"
+                        + " OR raw_text LIKE '%待对方确认%'"
+                        + " OR raw_text LIKE '%待入账%'"
+                        + " OR raw_text LIKE '%处理中%'"
+                        + ")";
+        db.execSQL(
+                "DELETE FROM " + TABLE_TRANSACTIONS
+                        + " WHERE EXISTS (SELECT 1 FROM " + TABLE_RAW_CAPTURES
+                        + " WHERE " + TABLE_RAW_CAPTURES + ".source_key=" + TABLE_TRANSACTIONS + ".source_key"
+                        + " AND " + TABLE_RAW_CAPTURES + ".amount_cents=" + TABLE_TRANSACTIONS + ".amount_cents"
+                        + " AND " + TABLE_RAW_CAPTURES + ".direction=" + TABLE_TRANSACTIONS + ".direction"
+                        + " AND ABS(" + TABLE_RAW_CAPTURES + ".occurred_at-" + TABLE_TRANSACTIONS + ".occurred_at)<300000"
+                        + " AND " + TABLE_RAW_CAPTURES + ".source_key='WECHAT'"
+                        + " AND " + pendingTransfer
+                        + ")"
+        );
+        db.execSQL(
+                "UPDATE " + TABLE_RAW_CAPTURES
+                        + " SET status='PENDING'"
+                        + " WHERE source_key='WECHAT' AND " + pendingTransfer
+        );
     }
 }

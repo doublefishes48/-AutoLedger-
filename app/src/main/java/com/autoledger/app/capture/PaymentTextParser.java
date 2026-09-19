@@ -152,7 +152,7 @@ public final class PaymentTextParser {
                 "支付成功", "付款成功", "交易成功", "支付完成", "付款完成",
                 "已完成支付"
         );
-        if (CaptureChannel.ACCESSIBILITY.equals(channel)) {
+        if (isVisualCapture(channel)) {
             String compact = text.replaceAll("\\s+", "");
             if (containsAny(text, BROWSING_PAGE_WORDS)
                     || compact.contains("首页理财")
@@ -179,7 +179,8 @@ public final class PaymentTextParser {
         if (containsAny(
                 text,
                 "收款成功", "退款成功", "你有一笔", "消费", "支出", "退款",
-                "已付款", "已支付", "扣款成功"
+                "已付款", "已支付", "扣款成功", "自动扣款", "免密支付",
+                "扣款支付"
         ) && !containsAny(
                 text,
                 "最高", "立减", "立减券", "优惠券", "代金券", "抽奖",
@@ -223,7 +224,7 @@ public final class PaymentTextParser {
                 "支付成功", "付款成功", "交易成功", "支付完成", "支付了", "已支付",
                 "已付款", "扣款成功", "扣款", "消费", "支出", "付款给",
                 "微信支付", "购买成功", "支付结果", "交易结果", "已完成支付",
-                "付款完成"
+                "付款完成", "自动扣款", "免密支付", "扣款支付"
         )
                 || containsAny(
                 compact,
@@ -401,6 +402,7 @@ public final class PaymentTextParser {
                 Pattern.compile("向\\s*(?!你|您)([^\\s，。：:]{1,40})\\s*(?:付款|支付)"),
                 Pattern.compile("付款给\\s*([^\\s，。：:]{1,40})"),
                 Pattern.compile("在\\s*([^\\s，。：:]{1,24}?)\\s*(?:消费|购买)"),
+                Pattern.compile("你在\\s*([^\\s，。：:]{1,40})\\s*有一笔"),
                 Pattern.compile("(?:商户|商家|收款方)\\s*[:：]\\s*([^\\s，。]{1,40})"),
                 Pattern.compile("向商户\\s*([^\\s，。]{1,40})?\\s*付款")
         };
@@ -471,7 +473,8 @@ public final class PaymentTextParser {
                 "支付", "付款", "交易", "成功", "失败", "返回", "回首页",
                 "完成", "关闭", "首页", "更多", "取消", "商家", "全部会话",
                 "消息盒子", "消息", "我的", "全部", "收付款", "扫一扫", "卡包",
-                "出行", "通讯录", "群福利", "红包", "转账"
+                "出行", "通讯录", "群福利", "群收款", "二维码收款", "赞赏码",
+                "红包", "转账"
         )) {
             return false;
         }
@@ -566,12 +569,14 @@ public final class PaymentTextParser {
             score += 0.22;
         }
         if (CaptureChannel.ACCESSIBILITY.equals(channel)
-                && containsAny(
+                || CaptureChannel.OCR.equals(channel)) {
+            if (containsAny(
                 text,
                 "支付成功", "付款成功", "交易成功", "支付完成", "付款完成",
                 "已完成支付", "支付结果", "交易结果"
         )) {
             score += 0.10;
+        }
         }
         if (title != null && !title.trim().isEmpty()) {
             score += 0.04;
@@ -585,6 +590,11 @@ public final class PaymentTextParser {
             score += 0.06;
         }
         return Math.max(0.0, Math.min(0.96, score));
+    }
+
+    private static boolean isVisualCapture(String channel) {
+        return CaptureChannel.ACCESSIBILITY.equals(channel)
+                || CaptureChannel.OCR.equals(channel);
     }
 
     private static boolean containsAny(String text, String... words) {

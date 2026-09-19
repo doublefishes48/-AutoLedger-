@@ -173,6 +173,21 @@ public class PaymentTextParserTest {
     }
 
     @Test
+    public void acceptsAlipayAutomaticDeductionWithRewardTail() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_ALIPAY,
+                CaptureChannel.NOTIFICATION,
+                "交易提醒",
+                "你在北京极智简单科技有限公司有一笔3.00元的免密/自动扣款支付，点击领取6个支付宝积分。",
+                1000L
+        );
+        assertNotNull("raw=" + resultText(result), result);
+        assertEquals(300L, result.amountCents);
+        assertEquals(LedgerEntry.DIRECTION_EXPENSE, result.direction);
+        assertEquals("北京极智简单科技有限公司", result.merchant);
+    }
+
+    @Test
     public void autoConfirmsAlipayScanSuccessPage() {
         RecognitionResult result = PaymentTextParser.parse(
                 CapturePackages.PACKAGE_ALIPAY,
@@ -184,6 +199,21 @@ public class PaymentTextParserTest {
         assertNotNull("raw=" + resultText(result), result);
         assertEquals(250L, result.amountCents);
         assertEquals(LedgerEntry.DIRECTION_EXPENSE, result.direction);
+        assertTrue(result.confidence >= 0.82);
+    }
+
+    @Test
+    public void autoConfirmsWechatOcrSuccessPage() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.OCR,
+                null,
+                "支付成功 蜜雪冰城 ￥2.00 完成",
+                1000L
+        );
+        assertNotNull("raw=" + resultText(result), result);
+        assertEquals(200L, result.amountCents);
+        assertEquals("蜜雪冰城", result.merchant);
         assertTrue(result.confidence >= 0.82);
     }
 
@@ -201,6 +231,22 @@ public class PaymentTextParserTest {
         assertEquals(LedgerEntry.DIRECTION_EXPENSE, result.direction);
         assertEquals("拼多多", result.merchant);
         assertTrue(result.confidence >= 0.82);
+    }
+
+    @Test
+    public void usesResultMerchantInsteadOfWechatPayCodeMenu() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.ACCESSIBILITY,
+                null,
+                "收付款 付款码 付款条码，可向收银员出示，双击可全屏展示付款码数字 "
+                        + "付款二维码,双击可全屏展示 二维码收款 面对面红包 向银行卡或手机号转账 "
+                        + "赞赏码 群收款 支付成功 蜜雪冰城 ￥7.00 完成",
+                1000L
+        );
+        assertNotNull("raw=" + resultText(result), result);
+        assertEquals(700L, result.amountCents);
+        assertEquals("蜜雪冰城", result.merchant);
     }
 
     @Test
