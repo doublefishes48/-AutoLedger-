@@ -275,6 +275,69 @@ public class PaymentTextParserTest {
         assertNull("raw=" + resultText(result), result);
     }
 
+    @Test
+    public void rejectsWechatPaymentConfirmationPage() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.OCR,
+                null,
+                "15:46 付款給 佳兴奶茶(**长) 全額 ¥3 添加备注 付款 微信支付",
+                1000L
+        );
+        assertNull("raw=" + resultText(result), result);
+    }
+
+    @Test
+    public void doesNotUseCurrencyAmountAsMerchant() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.ACCESSIBILITY,
+                null,
+                "支付成功 ¥3.00 完成",
+                1000L
+        );
+        assertNotNull("raw=" + resultText(result), result);
+        assertEquals(300L, result.amountCents);
+        assertEquals("", result.merchant);
+    }
+
+    @Test
+    public void rejectsWechatPendingReceiptOcr() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.OCR,
+                null,
+                "选择收到 零钱 零钱通 待你收款 ¥7.00 收款时间 2026年09月20日 21:33:49",
+                1000L
+        );
+        assertNull("raw=" + resultText(result), result);
+    }
+
+    @Test
+    public void rejectsWechatTransferAwaitingRecipientConfirmation() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.ACCESSIBILITY,
+                null,
+                "支付成功 待饮水确认收款 ￥14.00 完成",
+                1000L
+        );
+        assertNull("raw=" + resultText(result), result);
+    }
+
+    @Test
+    public void rejectsWechatServiceMenuOcr() {
+        RecognitionResult result = PaymentTextParser.parse(
+                CapturePackages.PACKAGE_WECHAT,
+                CaptureChannel.OCR,
+                null,
+                "0:22 金融理财 信用卡还款 生活服务 手机充值 腾讯公益 "
+                        + "收付款 交通出行 购物消费 生活缴费 医疗健康 保险服务 城市服务",
+                1000L
+        );
+        assertNull("raw=" + resultText(result), result);
+    }
+
     private static String resultText(RecognitionResult result) {
         return result == null ? "null" : result.rawText;
     }

@@ -45,6 +45,14 @@ public final class PaymentTextParser {
             "当前状态", "收单机构", "申请电子凭证", "点击查看全部消息",
             "全部会话", "消息盒子", "使用零钱支付", "使用零钱通支付"
     };
+    private static final String[] PAYMENT_CONFIRM_PAGE_WORDS = {
+            "添加备注", "全额", "全額", "付款给", "付款給"
+    };
+    private static final String[] WECHAT_SERVICE_MENU_WORDS = {
+            "金融理财", "信用卡还款", "生活服务", "手机充值", "腾讯公益",
+            "收付款", "交通出行", "购物消费", "生活缴费", "医疗健康",
+            "保险服务", "Q币充值", "城市服务"
+    };
 
     private PaymentTextParser() {
     }
@@ -155,6 +163,14 @@ public final class PaymentTextParser {
         if (isVisualCapture(channel)) {
             String compact = text.replaceAll("\\s+", "");
             if (containsAny(text, BROWSING_PAGE_WORDS)
+                    || (containsAny(text, PAYMENT_CONFIRM_PAGE_WORDS)
+                    && containsAny(text, "付款", "支付"))
+                    || isAwaitingReceiptPage(compact)
+                    || (isWechatServiceMenuPage(compact)
+                    && !containsAny(
+                    text,
+                    "支付成功", "付款成功", "交易成功", "已完成支付", "付款完成"
+            ))
                     || compact.contains("首页理财")
                     || compact.contains("消息我的")
                     || compact.contains("分钟前")
@@ -190,6 +206,24 @@ public final class PaymentTextParser {
             return false;
         }
         return true;
+    }
+
+    private static boolean isAwaitingReceiptPage(String compact) {
+        return compact.contains("待你收款")
+                || compact.contains("待对方确认")
+                || compact.contains("等待对方确认")
+                || (compact.contains("待")
+                && compact.contains("确认收款"));
+    }
+
+    private static boolean isWechatServiceMenuPage(String compact) {
+        int matches = 0;
+        for (String word : WECHAT_SERVICE_MENU_WORDS) {
+            if (compact.contains(word) && ++matches >= 4) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Long extractAmount(String text) {
@@ -459,6 +493,9 @@ public final class PaymentTextParser {
             return false;
         }
         if (merchant.matches("[0-9.]+")) {
+            return false;
+        }
+        if (merchant.matches("[¥￥]?\\s*[0-9]{1,9}(?:\\.[0-9]{1,2})?")) {
             return false;
         }
         if ((SourceKey.WECHAT.equals(sourceKey)

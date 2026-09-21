@@ -25,6 +25,7 @@ public final class LedgerRepository {
     private static final long RECENT_DUPLICATE_WINDOW_MS = 12L * 60L * 60L * 1000L;
     private static final long RECENT_AMOUNT_WINDOW_MS = 30L * 60L * 1000L;
     private static final long EVIDENCE_MERGE_WINDOW_MS = 5L * 60L * 1000L;
+    private static final long PENDING_MERGE_WINDOW_MS = 20L * 1000L;
     private static final int AMOUNT_CONFLICT_THRESHOLD = 3;
     private static final java.util.regex.Pattern CURRENCY_AMOUNT = java.util.regex.Pattern.compile(
             "[¥￥]\\s*([0-9]{1,9}(?:\\.[0-9]{1,2})?)"
@@ -331,45 +332,53 @@ public final class LedgerRepository {
             SQLiteDatabase db = database.getWritableDatabase();
             db.beginTransaction();
             try {
-                ContentValues raw = new ContentValues();
-                raw.put("fingerprint", fingerprintFor(result));
-                raw.put("channel", result.channel);
-                raw.put("package_name", result.packageName == null ? "" : result.packageName);
-                raw.put("source_key", result.sourceKey == null ? SourceKey.MANUAL : result.sourceKey);
-                raw.put("title", result.title == null ? "" : result.title);
-                raw.put("raw_text", result.rawText == null ? "" : result.rawText);
-                raw.put("amount_cents", result.amountCents);
-                raw.put("direction", result.direction);
-                raw.put("category", result.category);
-                raw.put("merchant", result.merchant);
-                raw.put("account", sourceLabel(result.sourceKey));
-                raw.put("occurred_at", result.occurredAt);
-                raw.put("confidence", result.confidence);
-                raw.put("status", RawCaptureRecord.STATUS_PENDING);
-                raw.put("created_at", System.currentTimeMillis());
+                RawCaptureRecord pending = findRecentPendingCapture(db, result);
+                RecognitionResult effectiveResult = result;
+                long rawId;
+                if (pending != null) {
+                    effectiveResult = mergePendingCapture(db, pending, result);
+                    rawId = pending.id;
+                } else {
+                    ContentValues raw = new ContentValues();
+                    raw.put("fingerprint", fingerprintFor(result));
+                    raw.put("channel", result.channel);
+                    raw.put("package_name", result.packageName == null ? "" : result.packageName);
+                    raw.put("source_key", result.sourceKey == null ? SourceKey.MANUAL : result.sourceKey);
+                    raw.put("title", result.title == null ? "" : result.title);
+                    raw.put("raw_text", result.rawText == null ? "" : result.rawText);
+                    raw.put("amount_cents", result.amountCents);
+                    raw.put("direction", result.direction);
+                    raw.put("category", result.category);
+                    raw.put("merchant", result.merchant);
+                    raw.put("account", sourceLabel(result.sourceKey));
+                    raw.put("occurred_at", result.occurredAt);
+                    raw.put("confidence", result.confidence);
+                    raw.put("status", RawCaptureRecord.STATUS_PENDING);
+                    raw.put("created_at", System.currentTimeMillis());
+                    rawId = db.insertWithOnConflict(
+                            TABLE_RAW_CAPTURES,
+                            null,
+                            raw,
+                            SQLiteDatabase.CONFLICT_IGNORE
+                    );
+                }
 
-                long rawId = db.insertWithOnConflict(
-                        TABLE_RAW_CAPTURES,
-                        null,
-                        raw,
-                        SQLiteDatabase.CONFLICT_IGNORE
-                );
                 if (rawId == -1) {
                     writeResult = 2;
                 } else {
-                    String reviewReason = reviewReason(db, result);
+                    String reviewReason = reviewReason(db, effectiveResult);
                     if (isAutoConfirmEnabled()
-                            && result.confidence >= AUTO_CONFIRM_THRESHOLD
+                            && effectiveResult.confidence >= AUTO_CONFIRM_THRESHOLD
                             && reviewReason == null) {
                         ContentValues transaction = transactionValues(
-                                result.amountCents,
-                                result.direction,
-                                result.category,
-                                result.merchant,
-                                sourceLabel(result.sourceKey),
+                                effectiveResult.amountCents,
+                                effectiveResult.direction,
+                                effectiveResult.category,
+                                effectiveResult.merchant,
+                                sourceLabel(effectiveResult.sourceKey),
                                 "",
-                                result.occurredAt,
-                                result.sourceKey
+                                effectiveResult.occurredAt,
+                                effectiveResult.sourceKey
                         );
                         db.insert(TABLE_TRANSACTIONS, null, transaction);
                         markCaptureStatus(db, rawId, RawCaptureRecord.STATUS_CONFIRMED);
@@ -390,10 +399,135 @@ public final class LedgerRepository {
         return writeResult;
     }
 
+    private static RawCaptureRecord findRecentPendingCapture(
+            SQLiteDatabase db,
+            RecognitionResult result
+    ) {
+        Cursor cursor = db.query(
+                TABLE_RAW_CAPTURES,
+                new String[]{"id"},
+                "source_key=? AND direction=? AND amount_cents=? AND status=?"
+                        + " AND occurred_at>=? AND occurred_at<=?",
+                new String[]{
+                        result.sourceKey,
+                        result.direction,
+                        String.valueOf(result.amountCents),
+                        RawCaptureRecord.STATUS_PENDING,
+                        String.valueOf(result.occurredAt - PENDING_MERGE_WINDOW_MS),
+                        String.valueOf(result.occurredAt + PENDING_MERGE_WINDOW_MS)
+                },
+                null,
+                null,
+                "occurred_at DESC, id DESC",
+                "1"
+        );
+        try {
+            return cursor.moveToFirst() ? findRawCapture(db, cursor.getLong(0)) : null;
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static RecognitionResult mergePendingCapture(
+            SQLiteDatabase db,
+            RawCaptureRecord existing,
+            RecognitionResult incoming
+    ) {
+        String merchant = betterMerchant(existing.merchant, incoming.merchant);
+        String category = normalizeMerchant(existing.merchant).equals(normalizeMerchant(merchant))
+                ? existing.category
+                : incoming.category;
+        String rawText = betterRawText(existing.rawText, incoming.rawText);
+        String title = incoming.title == null || incoming.title.isEmpty()
+                ? existing.title
+                : incoming.title;
+
+        ContentValues values = new ContentValues();
+        values.put("channel", incoming.channel);
+        values.put("package_name", incoming.packageName == null ? "" : incoming.packageName);
+        values.put("title", title == null ? "" : title);
+        values.put("raw_text", rawText == null ? "" : rawText);
+        values.put("category", category == null ? CategoryCatalog.OTHER : category);
+        values.put("merchant", merchant == null ? "" : merchant);
+        values.put("occurred_at", incoming.occurredAt);
+        values.put("confidence", Math.max(existing.confidence, incoming.confidence));
+        db.update(
+                TABLE_RAW_CAPTURES,
+                values,
+                "id=?",
+                new String[]{String.valueOf(existing.id)}
+        );
+
+        return new RecognitionResult(
+                incoming.sourceKey,
+                incoming.channel,
+                incoming.packageName,
+                title,
+                rawText,
+                incoming.amountCents,
+                incoming.direction,
+                category,
+                merchant,
+                incoming.occurredAt,
+                Math.max(existing.confidence, incoming.confidence)
+        );
+    }
+
+    private static String betterMerchant(String existing, String incoming) {
+        boolean existingUseful = existing != null
+                && !existing.isEmpty()
+                && !isSuspiciousMerchant(existing);
+        boolean incomingUseful = incoming != null
+                && !incoming.isEmpty()
+                && !isSuspiciousMerchant(incoming);
+        if (existingUseful && !incomingUseful) {
+            return existing;
+        }
+        if (incomingUseful && !existingUseful) {
+            return incoming;
+        }
+        if (existingUseful) {
+            return incoming.length() >= existing.length() ? incoming : existing;
+        }
+        String safeExisting = existing == null ? "" : existing;
+        String safeIncoming = incoming == null ? "" : incoming;
+        return safeIncoming.length() >= safeExisting.length()
+                ? safeIncoming
+                : safeExisting;
+    }
+
+    private static String betterRawText(String existing, String incoming) {
+        String oldText = existing == null ? "" : existing;
+        String newText = incoming == null ? "" : incoming;
+        boolean oldSuccess = oldText.contains("支付成功") || oldText.contains("付款成功");
+        boolean newSuccess = newText.contains("支付成功") || newText.contains("付款成功");
+        if (newSuccess && !oldSuccess) {
+            return newText;
+        }
+        if (oldSuccess && !newSuccess) {
+            return oldText;
+        }
+        return newText.length() >= oldText.length() ? newText : oldText;
+    }
+
+    private static boolean isVisualCapture(String channel) {
+        return CaptureChannel.ACCESSIBILITY.equals(channel)
+                || CaptureChannel.OCR.equals(channel);
+    }
+
     private static String reviewReason(
             SQLiteDatabase db,
             RecognitionResult result
     ) {
+        String rawText = result.rawText == null ? "" : result.rawText;
+        if (LedgerEntry.DIRECTION_EXPENSE.equals(result.direction)
+                && isVisualCapture(result.channel)
+                && (rawText.contains("支付成功") || rawText.contains("付款成功"))
+                && (result.merchant == null
+                || result.merchant.isEmpty()
+                || isSuspiciousMerchant(result.merchant))) {
+            return "missing_merchant";
+        }
         if (LedgerEntry.DIRECTION_EXPENSE.equals(result.direction)
                 && exceedsHistoricalExpenseMaximum(
                 result.amountCents,
@@ -769,7 +903,7 @@ public final class LedgerRepository {
         }
     }
 
-    private RawCaptureRecord findRawCapture(SQLiteDatabase db, long id) {
+    private static RawCaptureRecord findRawCapture(SQLiteDatabase db, long id) {
         Cursor cursor = db.query(
                 TABLE_RAW_CAPTURES,
                 null,
